@@ -40,23 +40,26 @@ def read_file(path):
     return path.read_bytes()
 
 
-def managed_markdown(path):
-    data = read_file(path)
-    media.require(data is None or data.startswith((media.GENERATED + "\n").encode()),
-                  f"Existing Markdown is not managed by this skill: {path}")
-    return data
+def published_files(folder):
+    media.document_at(folder)
+    files = [folder / media.INDEX_DOCUMENT]
+    legacy = media.legacy_document(folder)
+    if legacy:
+        files.append(legacy)
+    return files
+
+
+def published_digest(folder):
+    return {path.name: digest(data) for path in published_files(folder)
+            if (data := read_file(path)) is not None}
 
 
 def folder_for(row):
-    category = row["archive_type"]
-    media.require(isinstance(category, str) and 0 < len(category.encode()) <= 100
-                  and not media.BAD_NAME.search(category) and not category.startswith(".")
-                  and category == category.strip() and not category.endswith(".")
-                  and not media.DOS_NAME.fullmatch(category.split(".")[0]),
-                  f"Invalid archive category: {category}")
-    captured = row["annotation"].get("capture_time")
-    month = date.fromisoformat(captured[:10]).strftime("%Y-%m") if captured else "日期未知"
-    return Path("视频" if row["kind"] == "video" else "图片") / month / category
+    return media.folder_for(row)
+
+
+def align_name(name, kind, category):
+    return media.align_name(name, kind, category)
 
 
 def destination_folder(library, relative):
@@ -68,6 +71,33 @@ def destination_folder(library, relative):
         parent = parent.parent
     media.require(parent.is_dir(), f"Archive parent is not a directory: {parent}")
     return folder, parent
+
+
+def companion_moves(source, library, path, target, row):
+    peers = media.sidecars(path)
+    if not peers:
+        return []
+    media.require(row.get("archive_companions") is True and row["kind"] == "video",
+                  f"Paired files cannot be archived individually: {path}")
+    result = []
+    for name in peers:
+        peer = path.with_name(name)
+        stamp = media.fingerprint(peer)
+        media.require(stamp and peer.stem == path.stem and peer.suffix.lower() in {".srt", ".lrf"},
+                      f"Unsupported companion: {peer}")
+        destination = target.with_suffix(peer.suffix)
+        result.append({"source": str(peer.relative_to(source)),
+                       "target": str(destination.relative_to(library)), "fingerprint": stamp})
+    return result
+
+
+def group_members(row):
+    return [row, *row.get("companions", [])]
+
+
+def validate_group(origin, row):
+    expected = {Path(companion["source"]).name for companion in row.get("companions", [])}
+    media.require(set(media.archive_sidecars(origin)) == expected, f"Companion set changed: {origin}")
 
 
 def make_plan(source, library, review):
@@ -87,17 +117,16 @@ def make_plan(source, library, review):
         media.require(path not in source_set and stamp and stamp[2] > 0 and stamp == row["fingerprint"]
                       and media.kind(path) == row["kind"], f"Missing, repeated or changed source: {path}")
         source_set.add(path)
-        media.require(not media.sidecars(path), f"Paired files cannot be archived individually: {path}")
-        media.check_name(row["standard_name"], path, review["pattern"])
-        media.check_annotation(row["annotation"])
+        annotation = media.annotation_with_folder(row["annotation"], path, state)
+        media.require_voice(annotation, path)
         relative = folder_for(row)
+        standard_name = align_name(row["standard_name"], row["kind"], row["archive_type"])
+        media.check_name(standard_name, path, review["pattern"])
         folder, parent = destination_folder(library, relative)
         media.require(not folder.is_relative_to(source), f"Archive destination overlaps source: {folder}")
         media.require(stamp[0] == parent.stat().st_dev, f"Archive requires the same volume: {path} / {folder}")
-        target = folder / row["standard_name"]
-        normalized = media.key(str(target))
-        media.require(normalized not in destinations, f"Duplicate destination: {target}")
-        destinations.add(normalized)
+        target = folder / standard_name
+        companions = companion_moves(source, library, path, target, row)
         if folder not in folders:
             dest_state = state_dir(folder)
             media.require(not os.path.lexists(dest_state / "transaction.json"),
@@ -106,20 +135,25 @@ def make_plan(source, library, review):
             occupied = {media.key(peer.name) for peer in folder.iterdir()} if folder.exists() else set()
             occupied.update(media.key(entry["standard_name"]) for current, entry in dest_index["assets"].items()
                             if media.fingerprint(media.source_path(folder, current)) == entry["fingerprint"])
-            existing_md = managed_markdown(folder / media.MARKDOWN)
-            folders[folder] = (dest_index, occupied, digest(existing_md) if existing_md else None)
-        dest_index, occupied, markdown_digest = folders[folder]
-        media.check_name(row["standard_name"], path, dest_index.get("pattern", review["pattern"]))
-        media.require(media.key(target.name) not in occupied, f"Destination name occupied: {target}")
+            folders[folder] = (dest_index, occupied, published_digest(folder))
+        dest_index, occupied, index_digests = folders[folder]
+        media.check_name(standard_name, path, dest_index.get("pattern", review["pattern"]))
+        for member in [target, *(library / companion["target"] for companion in companions)]:
+            normalized = media.key(str(member))
+            media.require(normalized not in destinations, f"Duplicate destination: {member}")
+            media.require(media.key(member.name) not in occupied, f"Destination name occupied: {member}")
+            destinations.add(normalized)
         previous = index["assets"].get(row["source"], {})
         prepared = {"source": row["source"], "kind": row["kind"], "action": "archive",
-                     "fingerprint": stamp, "standard_name": row["standard_name"],
-                     "annotation": row["annotation"], "archive_type": row["archive_type"],
+                     "fingerprint": stamp, "standard_name": standard_name,
+                     "annotation": annotation, "archive_type": row["archive_type"],
                      "target": str(relative / target.name),
                      "original_path": previous.get("original_path", row["source"]),
                      "write_file_description": True, "prior_file_comment": media.file_comment(path),
                      "prior_file_tags": media.file_attribute(path, media.TAGS_ATTR),
-                     "destination_generation": dest_index["generation"], "destination_markdown_sha256": markdown_digest}
+                     "destination_generation": dest_index["generation"], "destination_index_digests": index_digests}
+        if companions:
+            prepared.update(archive_companions=True, companions=companions)
         media.planned_tags(prepared)
         rows.append(prepared)
     media.require(rows, "No rows selected for archiving.")
@@ -151,63 +185,203 @@ def rollback(journal, batch):
     media.sync_dir(journal.parent)
 
 
-def apply_plan(source, library, journal, plan):
-    media.require(make_plan(source, library, plan) == plan, "Plan differs from current validation.")
-    source_md = source / media.MARKDOWN
-    managed_markdown(source_md)
+def archive_record(documents, source, library, rows):
+    by_source = {row["source"]: row for row in rows}
+    for document in documents:
+        if document.suffix != ".json" or not document.exists():
+            continue
+        doc = media.read(document)
+        media.require(isinstance(doc, dict) and doc.get("generated_by") == media.GENERATED_BY,
+                      f"Not a media-preflight index: {document}")
+        for asset in doc["assets"]:
+            row = by_source.get(asset["path"])
+            if not row:
+                continue
+            asset["status"] = "archived"
+            asset["archived_path"] = str(library / row["target"])
+            asset["archived_filename"] = Path(row["target"]).name
+            asset.setdefault("original_filename", asset.get("filename"))
+            asset.setdefault("source_path", str((source / row["source"]).resolve()))
+        doc["mode"] = "archived"
+        media.save(document, doc)
+
+
+def execute(source, library, journal, rows, pattern, keep_source_document=False):
+    source_documents = published_files(source)
     source_index = state_dir(source) / "index.json"
     source_catalog = media.index_at(source_index.parent)
     common = Path(os.path.commonpath([source, library]))
-    groups, moves = {}, []
-    for row in plan["rows"]:
+    groups, moves, primary_moves = {}, [], []
+    for row in rows:
         target = library / row["target"]
         groups.setdefault(target.parent, []).append(row)
-        moves.append({**row, "source": str((source / row["source"]).relative_to(common)),
-                      "target": str(target.relative_to(common))})
-    files = [source_md, source_index]
+        primary_moves.append(row)
+        for member in group_members(row):
+            moves.append({**member, "source": str((source / member["source"]).relative_to(common)),
+                          "target": str((library / member["target"]).relative_to(common))})
+    export_folders = {library}
     for folder in groups:
-        files.extend([folder / media.MARKDOWN, state_dir(folder) / "index.json"])
-    batch = {"source": str(source), "common_root": str(common), "moves": moves, "backups": {str(p): snapshot(p) for p in files}}
+        while folder not in export_folders:
+            export_folders.add(folder)
+            folder = folder.parent
+    ordered_exports = sorted(export_folders, key=lambda folder: (-len(folder.parts), str(folder)))
+    files = {*source_documents, source_index}
+    for folder in ordered_exports:
+        files.update(published_files(folder))
+        if folder in groups:
+            files.add(state_dir(folder) / "index.json")
+    batch = {"source": str(source), "common_root": str(common), "moves": moves,
+             "backups": {str(p): snapshot(p) for p in files}}
     media.save(journal, batch)
     try:
         for folder in groups:
             folder.mkdir(parents=True, exist_ok=True)
             state_dir(folder).mkdir(mode=0o700, exist_ok=True)
-        for row in moves:
-            origin = media.source_path(common, row["source"])
-            target = media.source_path(common, row["target"])
-            media.require(media.fingerprint(origin) == row["fingerprint"] and not media.sidecars(origin),
-                          f"Source changed or new paired files: {origin}")
+        for row in primary_moves:
+            origin = media.source_path(source, row["source"])
+            target = media.source_path(library, row["target"])
+            validate_group(origin, row)
+            if "prior_file_comment" not in row:
+                row["prior_file_comment"] = media.file_comment(origin)
+                row["prior_file_tags"] = media.file_attribute(origin, media.TAGS_ATTR)
+            for member in group_members(row):
+                path = media.source_path(source, member["source"])
+                media.require(media.fingerprint(path) == member["fingerprint"], f"Source changed: {path}")
             media.require(media.file_comment(origin) == row["prior_file_comment"], f"Comment changed: {origin}")
             media.require(media.file_attribute(origin, media.TAGS_ATTR) == row["prior_file_tags"],
                           f"Tags changed: {origin}")
-            media.move_exclusive(origin, target)
+            media.move_exclusive(origin, target, sync=False)
             media.set_comment(target, media.planned_comment(row))
             media.set_attribute(target, media.TAGS_ATTR, media.planned_tags(row))
-        for folder, rows in groups.items():
+            for member in row.get("companions", []):
+                media.move_exclusive(media.source_path(source, member["source"]),
+                                     media.source_path(library, member["target"]), sync=False)
+        for folder in {folder for folder in groups} | {source}:
+            media.sync_dir(folder)
+        for folder, folder_rows in groups.items():
             state = state_dir(folder)
             index = media.index_at(state)
-            for row in rows:
+            for row in folder_rows:
                 target = Path(row["target"]).name
-                index["assets"][target] = {k: row[k] for k in
-                                           ("kind", "fingerprint", "standard_name", "annotation", "original_path")}
-            index.update(pattern=index.get("pattern", plan["pattern"]), generation=uuid.uuid4().hex)
+                entry = {k: row[k] for k in ("kind", "fingerprint", "standard_name", "annotation")}
+                entry["original_path"] = row.get("original_path", row["source"])
+                entry["original_filename"] = row.get("original_filename") or Path(row["source"]).name
+                entry["source_path"] = row.get("source_path") or str((source / row["source"]).resolve())
+                if row.get("archive_type"):
+                    entry["archive_type"] = row["archive_type"]
+                if row.get("companions"):
+                    entry["companions"] = [Path(member["target"]).name for member in row["companions"]]
+                index["assets"][target] = entry
+            index.update(pattern=index.get("pattern", pattern), generation=uuid.uuid4().hex)
             media.save(state / "index.json", index)
-            media.render_markdown(folder, state, argparse.Namespace(plan=None))
         if source_index.is_file():
-            for row in plan["rows"]:
+            for row in rows:
                 source_catalog["assets"].pop(row["source"], None)
             source_catalog["generation"] = uuid.uuid4().hex
             media.save(source_index, source_catalog)
-        if os.path.lexists(source_md):
-            source_md.unlink()
-            media.sync_dir(source)
+        if keep_source_document:
+            archive_record(source_documents, source, library, rows)
+        else:
+            for path in source_documents:
+                if os.path.lexists(path):
+                    path.unlink()
+                    media.sync_dir(source)
+        metadata_cache = {}
+        for folder in ordered_exports:
+            media.render_index(folder, state_dir(folder), argparse.Namespace(plan=None), metadata_cache=metadata_cache)
     except (OSError, ValueError, KeyError, TypeError, KeyboardInterrupt):
         rollback(journal, batch)
         raise
     journal.unlink()
     media.sync_dir(journal.parent)
-    return {"archived": len(moves), "updated_indexes": [str(folder / media.MARKDOWN) for folder in groups]}
+    return {"archived": len(rows), "companions_archived": len(moves) - len(rows),
+            "updated_indexes": [str(folder / media.INDEX_DOCUMENT) for folder in ordered_exports]}
+
+
+def apply_plan(source, library, journal, plan):
+    media.require(make_plan(source, library, plan) == plan, "Plan differs from current validation.")
+    return execute(source, library, journal, plan["rows"], plan["pattern"])
+
+
+INDEX_SYSTEM = {"path", "filename", "standard_name", "kind", "status", "issues",
+                "companions", "size_bytes", "mtime_ns", "proposal", "original_path",
+                "original_filename", "source_path", "archive_type", "archive_target",
+                "archived_path", "archived_filename", "plan_sha256"}
+
+
+def index_rows(source, library, doc):
+    pattern = doc.get("pattern") or media.DEFAULT_PATTERN
+    rows, skipped, seen = [], [], set()
+    for asset in doc["assets"]:
+        category = asset.get("archive_type")
+        if not category:
+            skipped.append(asset["path"])
+            continue
+        path = media.source_path(source, asset["path"])
+        stamp = media.fingerprint(path)
+        media.require(stamp and stamp[2] > 0 and stamp[2] == asset.get("size_bytes")
+                      and stamp[3] == asset.get("mtime_ns"),
+                      f"File changed since the index was written: {path}")
+        annotation = media.annotation_with_folder(
+            {k: v for k, v in asset.items() if k not in INDEX_SYSTEM and v is not None},
+            path, source / media.STATE)
+        media.require_voice(annotation, path)
+        relative = media.folder_for({"kind": asset["kind"], "archive_type": category,
+                                     "annotation": annotation, "standard_name": asset["standard_name"]})
+        standard_name = media.align_name(asset["standard_name"], asset["kind"], category)
+        media.check_name(standard_name, path, pattern)
+        target_rel = relative / standard_name
+        media.require(target_rel not in seen, f"Duplicate destination: {target_rel}")
+        seen.add(target_rel)
+        folder, parent = destination_folder(library, relative)
+        media.require(stamp[0] == parent.stat().st_dev,
+                      f"Archive requires the same volume: {path} / {folder}")
+        target = folder / standard_name
+        occupied = {media.key(peer.name) for peer in folder.iterdir()} if folder.exists() else set()
+        dest_index = media.index_at(state_dir(folder))
+        occupied.update(media.key(entry["standard_name"]) for current, entry in dest_index["assets"].items()
+                        if media.fingerprint(media.source_path(folder, current)) == entry["fingerprint"])
+        media.require(media.key(standard_name) not in occupied, f"Destination name occupied: {target}")
+        peers = asset.get("companions") or []
+        media.require(set(media.archive_sidecars(path)) == {Path(peer).name for peer in peers},
+                      f"Companion set changed since the index was written: {path}")
+        companions = []
+        for peer in peers:
+            peer_path = media.source_path(source, peer)
+            peer_stamp = media.fingerprint(peer_path)
+            media.require(peer_stamp and Path(peer).stem == Path(asset["path"]).stem
+                          and Path(peer).suffix.lower() in {".srt", ".lrf"},
+                          f"Unsupported companion: {peer_path}")
+            companions.append({"source": peer,
+                               "target": str(relative / (Path(standard_name).stem + Path(peer).suffix)),
+                               "fingerprint": peer_stamp})
+        rows.append({"source": asset["path"], "target": str(target_rel), "kind": asset["kind"],
+                     "fingerprint": stamp, "standard_name": standard_name, "annotation": annotation,
+                     "archive_type": category,
+                     "original_path": asset.get("original_path") or asset["path"],
+                     "original_filename": asset.get("original_filename") or asset["filename"],
+                     "source_path": asset.get("source_path") or str(path.resolve()),
+                     "companions": companions,
+                     "prior_file_comment": media.file_comment(path),
+                     "prior_file_tags": media.file_attribute(path, media.TAGS_ATTR)})
+    return rows, skipped
+
+
+def batch(index_path, library):
+    index_path = index_path.expanduser().resolve()
+    source = index_path.parent
+    doc = media.read(index_path)
+    media.require(isinstance(doc, dict) and doc.get("generated_by") == media.GENERATED_BY
+                  and doc.get("schema_version") == 1 and isinstance(doc.get("assets"), list),
+                  f"Not a media-preflight index: {index_path}")
+    journal = state_dir(library) / JOURNAL
+    media.require(not os.path.lexists(journal), "Library has an interrupted archive.")
+    rows, skipped = index_rows(source, library, doc)
+    media.require(rows, "No assets with archive_type to archive.")
+    summary = execute(source, library, journal, rows, doc.get("pattern") or media.DEFAULT_PATTERN,
+                      keep_source_document=True)
+    archive_record([index_path], source, library, rows)
+    return {**summary, "skipped_without_category": skipped}
 
 
 def main():
@@ -223,8 +397,23 @@ def main():
             cmd.add_argument("--sha256", required=True)
         if name == "recover":
             cmd.add_argument("--confirm", action="store_true")
+    batch_parser = commands.add_parser("batch")
+    batch_parser.add_argument("index", type=Path)
+    batch_parser.add_argument("library", type=Path)
     args = parser.parse_args()
     try:
+        if args.command == "batch":
+            library = directory(args.library)
+            state = state_dir(library)
+            state.mkdir(mode=0o700, exist_ok=True)
+            lock = os.open(state, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                result = batch(args.index, library)
+            finally:
+                os.close(lock)
+            sys.stdout.buffer.write(media.encode(result))
+            return
         source, library = directory(args.source), directory(args.library)
         state = state_dir(library)
         journal = state / JOURNAL
@@ -236,9 +425,11 @@ def main():
             raw = args.input.read_bytes()
             plan = json.loads(raw)
             media.require(make_plan(source, library, plan) == plan, "Plan differs from current validation.")
-            proposed = {row["source"]: {**row, "archive_destination": str(library / row["target"])}
+            proposed = {row["source"]: {**row, "archive_destination": str(library / row["target"]),
+                        "companion_destinations": [(item["source"], str(library / item["target"]))
+                                                   for item in row.get("companions", [])]}
                         for row in plan["rows"]}
-            result = media.render_markdown(source, state_dir(source), argparse.Namespace(plan=None),
+            result = media.render_index(source, state_dir(source), argparse.Namespace(plan=None),
                                            archive_preview=(proposed, digest(raw)))
         else:
             if args.command == "apply":

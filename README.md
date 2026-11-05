@@ -1,119 +1,159 @@
 # Media Preflight · 多媒体素材预处理
 
-一个给 Codex 用的本地素材整理 Skill。把拍摄目录变成一份可浏览的 `素材索引.md`，再按描述、标签和时间点快速挑出能剪的镜头。需要整理素材库时，可以先审阅完整去向，再批量改名、加标签和归档。
+一个给 Codex / Claude 等本地 Agent 用的素材整理 Skill：把一个拍摄目录变成可审阅的 `素材索引.json`，补齐画面描述与标签后，用一条命令批量改名、写 Finder 注释与标签、移动进素材库，并重建各级索引。
+
+面向「拍了一堆素材，想先看清楚再归档」的场景。所有处理在本地完成，脚本只用 Python 标准库，不需要 API 密钥。
 
 > **试试这样说**
 >
-> `$media-preflight` 帮我扫描「待整理素材」目录，给每条视频和图片建议标准名、画面描述和标签，先生成索引。
+> 用 `$media-preflight` 处理「待整理素材」目录：先测人声，生成索引，把每条视频的画面描述、标签和归档目标列给我确认。
 >
-> 接着可以说「找横屏的河岸逆光镜头，适合做过场」。
+> 确认后再说：按这份索引批量归档到素材库。
 
-## 两种工作模式
+## 工作流
 
-| 模式 | 适用场景 | 产出 |
-| --- | --- | --- |
-| 索引预览 | 先了解素材，或剪辑工程仍引用原路径 | 在源目录生成 `素材索引.md`。列出已合规与待处理素材、建议名称、原片链接、画面描述、标签和已核验的时间点 |
-| 确认归档 | 准备把素材收入长期素材库 | 按审阅过的方案批量改名、写 macOS 文件备注、追加 Finder 标签并移动。更新每个收到素材的分类索引，归档成功后撤下本批源目录生成的索引 |
+```text
+待整理素材/
+   │
+   ├─ 1. voice   逐个视频做 Silero VAD，判定 有人声 / 无人声
+   ├─ 2. render  生成 素材索引.json（含标准名、原文路径、建议归档路径）
+   ├─ 3. 人工审阅：补 description / evidence / tags / capture_time / archive_type
+   ├─ 4. 文本确认：原文件名 → 标准名 → 目标路径
+   └─ 5. batch   一次完成改名、注释、标签、移动、索引重建
+```
 
-索引预览只写 Markdown。用户可以在里面核对每条素材的完整归档目标。执行脚本还会比对计划的 SHA-256、源文件指纹和目标目录状态，并拦截重名或配对素材的单独移动。
+第 5 步只需两个参数：索引文件和素材库路径。
+
+```sh
+python3 scripts/archive.py batch "/path/to/inbox/素材索引.json" "/path/to/library"
+```
+
+没有 `archive_type` 的条目不会归档，会在输出的 `skipped_without_category` 里列出。索引生成后如果原件大小或修改时间变了，整批中止，不移动任何文件。
 
 ## 整理后是什么样
 
-默认文件名是 `日期_类型_场景_主体动作_序号.原扩展名`。素材库用「视频或图片 / 拍摄月份 / 内容类型」分层。拍摄日期缺乏依据时归到 `日期未知`。以下为示例。
+文件名用 `日期_类型_场景_主体动作_序号.原扩展名`。归档时**场景段取归档分类**，原场景并入主体动作：
+
+```text
+20261030_视频_碧绿河道_筏队行进_028.MP4          # 整理前
+20261030_视频_河谷与竹筏_碧绿河道筏队行进_028.MP4  # 归入「河谷与竹筏」后
+```
+
+目录按「类型 / 年-月 / 日 / 分类」分层：
 
 ```text
 素材库/
 ├── 视频/
-│   └── 2026-05/
-│       └── 河岸风景/
-│           ├── 20260518_视频_河岸_逆光步道与桥影_001.mp4
-│           └── 素材索引.md
+│   └── 2026-10/
+│       └── 30/
+│           ├── 河谷与竹筏/
+│           │   ├── 20261030_视频_河谷与竹筏_碧绿河道筏队行进_028.MP4
+│           │   ├── 20261030_视频_河谷与竹筏_碧绿河道筏队行进_028.SRT
+│           │   └── 素材索引.json
+│           └── 山地风光/
 └── 图片/
-    └── 2026-05/
-        └── 街景/
-            ├── 20260518_图片_旧街_窗边光影_002.jpg
-            └── 素材索引.md
+    └── 2026-10/
+        └── 30/
+            └── 团队群像/
 ```
 
-| 画面描述 | 标签 | 源片定位 |
-| --- | --- | --- |
-| 沿河岸步道向前拍。夕阳从树后照进来，镜头转向映在水里的桥影。 | 横屏、河岸、逆光、桥影、转场 | `00:04.20` 树间逆光 · `00:12.80` 水面桥影 |
+同主名的 `.SRT` / `.LRF` 会跟着主片一起移动并改成新主名。日期缺少可靠依据时归到 `日期未知`，不建日目录。
 
-时间点用于回到原片定位。正式落剪时，再回看片段确定连续可用的入出点和同期声。
+## 索引里有什么
 
-## 安装到 Codex
+`素材索引.json` 是递归汇总的：每个目录一份，父目录的 `assets` 合并所有下级素材，`child_indexes` 指向直接子索引。
 
-需要 Python 3.9+。要查看视频帧和媒体元数据，可以安装 FFmpeg（`ffmpeg`、`ffprobe`）。批量归档需要 **macOS**，且源目录和素材库位于同一支持扩展属性的卷。
+每条素材的关键字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `path` / `filename` | 相对当前索引的路径 / 当前文件名 |
+| `standard_name` | 标准名 |
+| `description` / `full_description` | 一句话画面摘要 / 逐段描述 |
+| `tags` | 来源、画面、剪辑用途，以及 `有人声` / `无人声` |
+| `evidence` | 证据：看了哪些帧、哪段原片、哪个旧报告 |
+| `capture_time` | 拍摄时间，决定归档到哪一天 |
+| `archive_type` | 归档分类；填了才会被 `batch` 归档 |
+| `archive_target` | 按规则算出的完整目标路径，供确认 |
+| `original_filename` | 归档前文件名（如 `DJI_20261030125833_0046_D.MP4`） |
+| `source_path` | 归档前完整路径（新批次自动写入） |
+| `companions` | 随主片移动的 SRT / LRF |
+
+归档执行后，源索引会保留为记录：`mode` 变成 `archived`，每条带 `status: archived`、`archived_path`、`archived_filename`，原始文件名与路径字段不变。素材库索引同样保留这些字段。
+
+## 人声标签
+
+视频必须有且只有一个 `有人声` 或 `无人声`。检测用 Silero VAD，只判断有没有人声候选，不转写、不花钱：
 
 ```sh
-mkdir -p "$HOME/.agents/skills"
+python3 scripts/media.py voice "/path/to/inbox" --python /path/to/venv/bin/python
+```
+
+- 需要 `faster-whisper`；`--python` 指向装了它的解释器，脚本会自动切换过去
+- 结果按 inode 缓存在 `.media-preflight/voice.json`，原件变了自动重测；`--force` 强制重跑
+- 已有豆包批处理产物时加 `--from-batch doubao_vad_batch.json`，按原件大小与修改时间复用
+- `无人声` 只代表 VAD 没检出，不等于确认没有语音；歌声、广播、音乐也可能被算作人声候选
+
+## 安装
+
+需要 Python 3.9+。归档功能需要 **macOS**，源与素材库在同一支持扩展属性的卷上。
+
+```sh
 git clone https://github.com/lord97j/media-preflight.git "$HOME/.agents/skills/media-preflight"
 ```
 
-在 Codex 中用 `$media-preflight` 调用，提供源目录的绝对路径。选择直接归档时，再提供素材库根目录。团队也可把整个 Skill 放入仓库的 `.agents/skills/media-preflight`。[Codex Skills 文档](https://learn.chatgpt.com/docs/build-skills)
+也可放到项目的 `.agents/skills/media-preflight`，或 `~/.codex/skills/`。可选依赖：
 
-## 命令行用法
+| 用途 | 依赖 |
+| --- | --- |
+| 读取视频时长、生成预览帧 | `ffmpeg` / `ffprobe` |
+| `voice` 人声检测 | `faster-whisper` |
+| `scripts/finder_comments.py` 同步 Finder 目录记录 | `ds-store`（建议装在独立 venv） |
 
-Codex 负责查看画面、判断证据和整理建议。Python 脚本负责盘点、预览、执行和检索。脚本使用标准库，运行时无需 API 密钥。
+## 命令行
 
-### 1. 生成基础索引
+| 命令 | 作用 |
+| --- | --- |
+| `media.py scan <dir>` | 盘点，输出待审阅 JSON（含命名/注释问题、人声状态） |
+| `media.py render <dir>` | 生成或刷新 `素材索引.json`；`--tree` 自下而上重建整库 |
+| `media.py voice <dir>` | 批量人声检测，写 `.media-preflight/voice.json` |
+| `media.py plan/apply/rollback` | 仅改名的索引提交，含计划 SHA-256 与回滚 |
+| `media.py search <dir> 词...` | 按文件名、标准名、标签、描述检索，可按 `--kind` 过滤 |
+| `archive.py batch <index> <library>` | 按索引一次完成改名、注释、标签、移动、索引重建 |
+| `archive.py plan/preview/apply` | 需要独立计划文件、逐条预览与 SHA-256 复核时使用 |
+| `archive.py recover` | 中断后检查/恢复归档事务 |
 
-在本仓库目录运行。先把 `source_dir` 换成实际素材路径，计划文件放在独立的临时目录。
-
-```sh
-source_dir="/path/to/inbox"
-library_dir="/path/to/media-library"
-review_dir="$(mktemp -d)"
-
-python3 scripts/media.py scan "$source_dir" > "$review_dir/review.json"
-python3 scripts/media.py render "$source_dir"
-```
-
-`render` 会在源目录生成 `素材索引.md`。把看过画面的候选项填回 `review.json`，保留扫描得到的源路径和指纹。每条注释至少填写 `description`、`tags` 和 `evidence`。对只登记建议名的条目用 `action: alias`。
-
-```sh
-python3 scripts/media.py plan "$source_dir" "$review_dir/review.json" > "$review_dir/plan.json"
-python3 scripts/media.py render "$source_dir" --plan "$review_dir/plan.json"
-```
-
-### 2. 审阅归档路径后再执行
-
-素材库根目录须已存在。将选中行的 `action` 改为 `archive`，补充 `archive_type`（例如「河岸风景」）和可信的 `annotation.capture_time`（例如 `2026-05-01T10:30:00+08:00`）。其余素材使用 `skip`。
+常用组合：
 
 ```sh
-python3 scripts/archive.py plan "$source_dir" "$library_dir" \
-  "$review_dir/review.json" > "$review_dir/archive.json"
+# 索引 + 人工补注释后直接归档
+python3 scripts/media.py render "/path/to/inbox"
+# ……编辑 /path/to/inbox/素材索引.json……
+python3 scripts/archive.py batch "/path/to/inbox/素材索引.json" "/path/to/library"
 
-python3 scripts/archive.py preview "$source_dir" "$library_dir" \
-  "$review_dir/archive.json"
+# 全库刷新索引（不动文件）
+python3 scripts/media.py render "/path/to/library" --tree
+
+# 按剪辑意图找镜头
+python3 scripts/media.py search "/path/to/library" 河边 逆光 转场 --kind video
 ```
 
-打开源目录的 `素材索引.md`，核对每项改动和目标路径。确认后，将下面的占位符替换为索引中显示的计划 SHA-256。
+## 安全与可恢复
 
-```sh
-python3 scripts/archive.py apply "$source_dir" "$library_dir" \
-  "$review_dir/archive.json" --sha256 "这里填写已确认的计划摘要"
-```
+- 每条素材记录指纹（设备、inode、大小、修改时间）；索引生成后原件变化会让整批中止
+- 归档前统一校验：标准名、目标重名、同卷、配套文件集合、人声标签、描述与证据完整性
+- 归档过程写入事务日志，异常自动回滚移动与索引；中断可用 `archive.py recover` 检查
+- 同名文件用排他重命名，不会覆盖；Finder 标签是合并而非替换，旧标签保留
+- 改名会破坏已有剪辑工程的引用，批量归档前需确认这一点
 
-遇到中断，可以先运行 `archive.py recover` 检查待恢复记录。完整命令与确认规则见 [SKILL.md](SKILL.md)。
+## 性能
 
-### 3. 按剪辑需求检索
+在本机（Apple silicon）用 120 个视频 + 60 个 SRT 实测：`batch` 全流程（改名、注释、标签、移动、重建 28 个索引）约 **0.7 秒**；生成 120 条索引约 **0.2 秒**。
 
-在已经提交或归档的分类目录里，可以按多个词同时匹配当前文件名、标准名和注释字段。
+主要来自三处：Finder 扩展属性走 libc 调用而不是 `xattr` 子进程（约 80 倍）、移动按批同步而不是每文件 fsync、索引只重建受影响目录。
 
-```sh
-python3 scripts/media.py search "$library_dir/视频/2026-05/河岸风景" \
-  横屏 逆光 河岸 --kind video
-```
-
-仅预览的建议可以直接在 Markdown 中浏览。提交后，可搜索的数据存于分类目录的 `.media-preflight/index.json`。
-
-## 文件备注和标签
-
-归档把画面描述写入 macOS 文件备注扩展属性，并在现有 Finder 标签上追加新标签。标签、描述、证据和时间点也会保存到分类索引。素材内容字节及 EXIF、IPTC、QuickTime 容器内的字段保持原样。
-
-## 许可与参考
+## 许可
 
 代码与文档使用 [MIT License](LICENSE)。
 
-模板与批量审阅流程参考了 RenamerX。[使用指南](https://sancijun.com/guides/renamerx-user-guide) · [官网](https://renamerx.com/zh)
+命名与批量审阅流程参考了 RenamerX。[使用指南](https://sancijun.com/guides/renamerx-user-guide) · [官网](https://renamerx.com/zh)
